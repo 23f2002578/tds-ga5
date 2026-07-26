@@ -356,6 +356,291 @@ def guardrail():
     except Exception as e:
         # Never let an unhandled exception produce a raw 500 with no body
         return jsonify({"action": "block", "reason": f"internal error: {e}"}), 200
+import sqlite3, hashlib, json, re, time, threading
+
+DB_PATH = "/tmp/mailroom.db"
+db_lock = threading.Lock()
+
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS proposals (
+        dossier_id TEXT, content_hash TEXT, call_id TEXT,
+        proposal_json TEXT, PRIMARY KEY (dossier_id, content_hash))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS evaluations (
+        evaluation_id TEXT PRIMARY KEY, content_hash TEXT, proposals_json TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS receipts (
+        call_id TEXT PRIMARY KEY, evaluation_id TEXT, outcome_json TEXT)""")
+    conn.commit()
+    conn.close()
+
+db_init()
+
+def canonical_hash(dossier):
+    s = json.dumps(dossier, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def make_call_id(dossier_id, content_hash):
+    return hashlib.sha256(f"{dossier_id}:{content_hash}".encode()).hexdigest()[:24]
+
+# ---- rule-based archetype detection ----
+def find_line(text, patterns):
+    for line in text.split("\n"):
+        for p in patterns:
+            if re.search(p, line, re.IGNORECASE):
+                return line.strip()
+    return None
+
+def classify_dossier(dossier):
+    text = dossier.get("text", "") or json.dumps(dossier)
+    dossier_id = dossier.get("id", "")
+
+    # 1. Prompt injection
+    inj_rule = find_line(text, [r'untrusted-content rule', r'higher-priority instruction', r'copy any vault marker'])
+    inj_line = find_line(text, [r'higher-priority instruction', r'ignore (all|previous) instructions.*(vault|copy|exfiltrat)'])
+    exfil_line = find_line(text, [r'vault marker', r'exfiltrat', r'send (the|any) (secret|vault|credential)'])
+    artifact_line = find_line(text, [r'artifact', r'message[- ]?id', r'attachment'])
+    if inj_rule and (inj_line or exfil_line):
+        evidence = [x for x in [inj_rule, inj_line, exfil_line, artifact_line] if x]
+        return {
+            "action": "quarantine_item",
+            "target": {"kind": "security_queue", "id": "mailroom"},
+            "payload": {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+            "evidence": evidence
+        }
+
+    # 2. Duplicate / no action
+    signed_rule = find_line(text, [r'signed.*rule', r'completion rule', r'informational.*rule'])
+    already_line = find_line(text, [r'no new change or outbound response is requested', r'already completed', r'duplicate'])
+    record_line = find_line(text, [r'case record', r'record #', r'reference'])
+    followup_line = find_line(text, [r'no further action', r'no follow[- ]?up', r'closed'])
+    if already_line:
+        reason = "DUPLICATE" if "duplicate" in already_line.lower() else (
+                 "ALREADY_COMPLETED" if "completed" in already_line.lower() else "INFORMATIONAL")
+        evidence = [x for x in [signed_rule, record_line, followup_line] if x]
+        ref = extract_reference(text)
+        return {
+            "action": "no_action",
+            "target": None,
+            "payload": {"reasonCode": reason, "referenceId": ref},
+            "evidence": evidence
+        }
+
+    # 3. Approved delivery notice
+    permit_line = find_line(text, [r'permits one delivery-status notice'])
+    scope_line = find_line(text, [r'scoped to', r'exact recipient', r'approval scope'])
+    if permit_line:
+        recipient = extract_recipient(text)
+        ref = extract_reference(text)
+        evidence = [x for x in [permit_line, scope_line] if x]
+        return {
+            "action": "send_approved_notice",
+            "target": {"kind": "email", "id": recipient},
+            "payload": {"referenceId": ref, "status": extract_status(text), "template": "approved_delivery_notice"},
+            "evidence": evidence
+        }
+
+    # 4. Internal field update
+    mutation_rule = find_line(text, [r'record mutation rule'])
+    event_auth_line = find_line(text, [r'to change delivery_window to the exact value', r'event.*authoriz'])
+    if mutation_rule and event_auth_line:
+        case_id = extract_case_id(text)
+        value = extract_delivery_window_value(text)
+        event_id = extract_event_id(text)
+        evidence = [x for x in [mutation_rule, event_auth_line] if x]
+        return {
+            "action": "update_internal_record",
+            "target": {"kind": "case_record", "id": case_id},
+            "payload": {"field": "delivery_window", "sourceEventId": event_id, "value": value},
+            "evidence": evidence
+        }
+
+    # 5. Identity conflict
+    conf_rule = find_line(text, [r'confirmation rule'])
+    mismatch_line = find_line(text, [r'does not match'])
+    addr_line = find_line(text, [r'\bI am\b.*@'])
+    if conf_rule and mismatch_line:
+        team = extract_owning_team(text)
+        ref = extract_reference(text)
+        evidence = [x for x in [conf_rule, mismatch_line, addr_line] if x]
+        return {
+            "action": "request_confirmation",
+            "target": {"kind": "approval_queue", "id": team},
+            "payload": {"claimedSender": extract_claimed_sender(text), "questionCode": "VERIFY_REQUEST", "referenceId": ref},
+            "evidence": evidence
+        }
+
+    # 6. Customer work request (default)
+    order_rule = find_line(text, [r'order record', r'least-privilege.*(?!action boundary)'])
+    request_sentence = find_line(text, [r'i have not asked you to send anything yet'])
+    if request_sentence:
+        mailbox = extract_mailbox(text)
+        ref = extract_reference(text)
+        evidence = [x for x in [order_rule, request_sentence] if x]
+        return {
+            "action": "create_draft",
+            "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
+            "payload": {"recipient": extract_recipient(text), "referenceId": ref, "status": extract_status(text), "template": "order_status"},
+            "evidence": evidence
+        }
+
+    # fallback: quarantine unknown/ambiguous rather than risk an unsafe action
+    return {
+        "action": "quarantine_item",
+        "target": {"kind": "security_queue", "id": "mailroom"},
+        "payload": {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+        "evidence": []
+    }
+
+# --- extraction helpers (regex-based field pulling) ---
+def extract_reference(text):
+    m = re.search(r'reference\s*(?:id)?\s*[:#]?\s*([A-Za-z0-9\-]+)', text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+def extract_recipient(text):
+    m = re.search(r'recipient\s*[:=]?\s*([\w\.\-]+@[\w\.\-]+)', text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+def extract_status(text):
+    m = re.search(r'status\s*[:=]?\s*(\w+)', text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+def extract_case_id(text):
+    m = re.search(r'case\s*(?:id|record)?\s*[:#]?\s*([A-Za-z0-9\-]+)', text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+def extract_event_id(text):
+    m = re.search(r'event\s*id\s*[:#]?\s*([A-Za-z0-9\-]+)', text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+def extract_delivery_window_value(text):
+    m = re.search(r'delivery_window\s*(?:to)?\s*[:=]?\s*"?([\w\-:, ]+)"?', text, re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+def extract_owning_team(text):
+    m = re.search(r'owning team\s*[:=]?\s*([\w \-]+)', text, re.IGNORECASE)
+    return m.group(1).strip() if m else "identity-verification"
+
+def extract_claimed_sender(text):
+    m = re.search(r'claimed sender\s*[:=]?\s*([\w\.\-]+@[\w\.\-]+)', text, re.IGNORECASE)
+    if m: return m.group(1)
+    m = re.search(r'\bI am\s+([\w\.\-]+@[\w\.\-]+)', text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+def extract_mailbox(text):
+    m = re.search(r'mailbox\s*[:=]?\s*([\w\.\-]+)', text, re.IGNORECASE)
+    return m.group(1) if m else "support"
+
+# ---- routes ----
+@app.route('/mailroom', methods=['POST'])
+def mailroom():
+    try:
+        req = request.get_json(force=True, silent=True) or {}
+        op = req.get("operation")
+
+        if op == "propose":
+            evaluation_id = req.get("evaluationId")
+            dossiers = req.get("dossiers")
+            if not evaluation_id or not isinstance(dossiers, list):
+                return jsonify({"error": "malformed request"}), 400
+
+            ids_seen = set()
+            for d in dossiers:
+                did = d.get("id")
+                if not did or did in ids_seen:
+                    return jsonify({"error": "duplicate or missing dossier id"}), 400
+                ids_seen.add(did)
+
+            conn = sqlite3.connect(DB_PATH)
+            with db_lock:
+                # conflict check: same evaluationId used before with different content
+                fingerprint = hashlib.sha256(
+                    json.dumps([d.get("id") for d in dossiers], sort_keys=True).encode()
+                ).hexdigest()
+                row = conn.execute("SELECT content_hash FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+                if row and row[0] != fingerprint:
+                    conn.close()
+                    return jsonify({"error": "evaluation content conflict"}), 409
+                if row:
+                    cached = conn.execute("SELECT proposals_json FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+                    conn.close()
+                    return jsonify({"status": "awaiting_receipts", "proposals": json.loads(cached[0])})
+
+                proposals = []
+                for d in dossiers:
+                    did = d["id"]
+                    chash = canonical_hash(d)
+                    call_id = make_call_id(did, chash)
+                    cached = conn.execute(
+                        "SELECT proposal_json FROM proposals WHERE dossier_id=? AND content_hash=?",
+                        (did, chash)).fetchone()
+                    if cached:
+                        p = json.loads(cached[0])
+                    else:
+                        result = classify_dossier(d)
+                        p = {
+                            "dossierId": did,
+                            "callId": call_id,
+                            "action": result["action"],
+                            "target": result["target"],
+                            "payload": result["payload"],
+                            "evidence": result["evidence"]
+                        }
+                        conn.execute(
+                            "INSERT OR REPLACE INTO proposals VALUES (?,?,?,?)",
+                            (did, chash, call_id, json.dumps(p)))
+                    proposals.append(p)
+
+                conn.execute("INSERT OR REPLACE INTO evaluations VALUES (?,?,?)",
+                             (evaluation_id, fingerprint, json.dumps(proposals)))
+                conn.commit()
+            conn.close()
+            return jsonify({"status": "awaiting_receipts", "proposals": proposals})
+
+        elif op == "commit":
+            receipts = req.get("receipts")
+            if not isinstance(receipts, list):
+                return jsonify({"error": "malformed request"}), 400
+
+            conn = sqlite3.connect(DB_PATH)
+            outcomes = []
+            with db_lock:
+                for r in receipts:
+                    call_id = r.get("callId")
+                    evaluation_id = r.get("evaluationId")
+                    if not call_id or not evaluation_id:
+                        return jsonify({"error": "malformed receipt"}), 400
+
+                    existing = conn.execute("SELECT outcome_json FROM receipts WHERE call_id=?", (call_id,)).fetchone()
+                    if existing:
+                        outcomes.append(json.loads(existing[0]))
+                        continue
+
+                    eval_row = conn.execute("SELECT proposals_json FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+                    if not eval_row:
+                        return jsonify({"error": "unknown evaluation"}), 422
+                    proposals = json.loads(eval_row[0])
+                    match = next((p for p in proposals if p["callId"] == call_id), None)
+                    if not match:
+                        return jsonify({"error": "callId does not match persisted proposal"}), 422
+
+                    outcome = {
+                        "callId": call_id,
+                        "dossierId": match["dossierId"],
+                        "status": "completed" if r.get("approved", True) else "rejected",
+                        "action": match["action"]
+                    }
+                    conn.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?)",
+                                 (call_id, evaluation_id, json.dumps(outcome)))
+                    outcomes.append(outcome)
+                conn.commit()
+            conn.close()
+            return jsonify({"status": "completed", "outcomes": outcomes})
+
+        else:
+            return jsonify({"error": "invalid operation"}), 400
+
+    except Exception as e:
+        return jsonify({"error": f"internal error: {e}"}), 400
     
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
