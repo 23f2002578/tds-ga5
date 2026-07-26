@@ -715,6 +715,7 @@ def agent_card():
     return jsonify(card), 200
 
 
-
+from a2a_invoice import register_a2a_routes
+register_a2a_routes(app)
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
