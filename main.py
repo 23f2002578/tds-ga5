@@ -261,22 +261,35 @@ def is_private_ip(host):
     except ValueError:
         return False
 
+import re
+
+IP_PATTERN = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
 def looks_like_internal_target(value):
     v = unquote(str(value)).strip().lower()
+
+    # explicit internal markers
     if "169.254.169.254" in v or "metadata" in v:
         return True
-    if "localhost" in v or "127.0.0.1" in v or "0.0.0.0" in v:
+    if re.search(r'\blocalhost\b', v) or "127.0.0.1" in v or "0.0.0.0" in v:
         return True
-    candidate = v
+
+    candidate = None
     if "://" in v:
+        # value is itself a URL — extract its host
         candidate = urlparse(v).hostname or ""
-    else:
+    elif IP_PATTERN.match(v.split("/")[0].split(":")[0]):
+        # value is a bare IP address
         candidate = v.split("/")[0].split(":")[0]
+    # NOTE: plain strings (emails, filenames, words with dots) are NOT
+    # treated as hosts — only actual URLs or bare IPs are inspected further
+
     if candidate:
         if is_private_ip(candidate):
             return True
-        if candidate not in ALLOWED_HOSTS and ("." in candidate or candidate == "localhost"):
+        if candidate not in ALLOWED_HOSTS:
             return True
+
     return False
 
 def host_is_safe(hostname):
