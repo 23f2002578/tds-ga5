@@ -588,6 +588,12 @@ def do_commit(req):
 def mailroom():
     try:
         req = request.get_json(force=True, silent=True) or {}
+
+        # Support both: plain custom API calls, AND JSON-RPC A2A calls
+        if req.get("jsonrpc") == "2.0" and "method" in req:
+            return handle_a2a_jsonrpc(req)
+
+        # fallback: direct custom-format calls (operation at top level)
         op = req.get("operation")
         if op == "propose":
             result, code = do_propose(req)
@@ -599,6 +605,61 @@ def mailroom():
     except Exception as e:
         return jsonify({"error": f"internal error: {e}"}), 400
 
+
+def handle_a2a_jsonrpc(req):
+    method = req.get("method")
+    req_id = req.get("id")
+    params = req.get("params", {})
+
+    if method != "message/send":
+        return jsonify({
+            "jsonrpc": "2.0", "id": req_id,
+            "error": {"code": -32601, "message": "Method not found"}
+        }), 200
+
+    message = params.get("message", {})
+    parts = message.get("parts", [])
+
+    payload = None
+    for part in parts:
+        if part.get("kind") == "data" and "data" in part:
+            payload = part["data"]; break
+        if "text" in part:
+            try:
+                payload = json.loads(part["text"]); break
+            except Exception:
+                pass
+
+    if not isinstance(payload, dict):
+        return jsonify({
+            "jsonrpc": "2.0", "id": req_id,
+            "error": {"code": -32602, "message": "Invalid params: no usable data/text part"}
+        }), 200
+
+    op = payload.get("operation")
+    if op == "propose":
+        result, status_code = do_propose(payload)
+    elif op == "commit":
+        result, status_code = do_commit(payload)
+    else:
+        return jsonify({
+            "jsonrpc": "2.0", "id": req_id,
+            "error": {"code": -32602, "message": "Invalid operation"}
+        }), 200
+
+    response_message = {
+        "kind": "message",
+        "role": "agent",
+        "messageId": f"resp-{req_id}",
+        "parts": [{"kind": "data", "data": result}]
+    }
+
+    return jsonify({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": response_message
+    }), 200
+    
 @app.route('/.well-known/agent-card.json', methods=['GET'])
 def agent_card():
     card = {
