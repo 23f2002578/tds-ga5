@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import re, math, yaml, json
+import hashlib
 
 app = Flask(__name__)
 
@@ -131,5 +132,76 @@ def check():
     return jsonify({"decision": "continue",
         "reason": f"Cumulative tokens_used ({cumulative}) is under budget ({budget_tokens}); no repeated identical calls detected."})
 
+import hashlib
+
+EMAIL = "23f2002578@ds.study.iitm.ac.in"
+
+@app.route('/mcp', methods=['POST'])
+def mcp():
+    req = request.get_json(force=True)
+    method = req.get("method")
+    req_id = req.get("id")
+
+    if method == "initialize":
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "exam-mcp-server", "version": "1.0.0"}
+            }
+        })
+
+    if method == "notifications/initialized":
+        return ("", 204)
+
+    if method == "tools/list":
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "solve_challenge",
+                        "description": "Solves the exam challenge using request headers.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
+                ]
+            }
+        })
+
+    if method == "tools/call":
+        params = req.get("params", {})
+        tool_name = params.get("name")
+        if tool_name == "solve_challenge":
+            challenge = request.headers.get("X-Exam-Challenge", "")
+            s = f"{challenge}:{EMAIL.strip().lower()}"
+            answer = hashlib.sha256(s.encode()).hexdigest()[:16]
+            return jsonify({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {"type": "text", "text": answer}
+                    ]
+                }
+            })
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": "Tool not found"}
+        })
+
+    return jsonify({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": "Method not found"}
+    })
+    
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
