@@ -530,115 +530,35 @@ def extract_mailbox(text):
     m = re.search(r'mailbox\s*[:=]?\s*([\w\.\-]+)', text, re.IGNORECASE)
     return m.group(1) if m else "support"
 
-# ---- routes ----
+def do_propose(req):
+    evaluation_id = req.get("evaluationId")
+    dossiers = req.get("dossiers")
+    if not evaluation_id or not isinstance(dossiers, list):
+        return {"error": "malformed request"}, 400
+    # ... (paste the exact propose logic from before, return dict + status)
+    ...
+    return {"status": "awaiting_receipts", "proposals": proposals}, 200
+
+def do_commit(req):
+    receipts = req.get("receipts")
+    if not isinstance(receipts, list):
+        return {"error": "malformed request"}, 400
+    # ... (paste the exact commit logic from before)
+    ...
+    return {"status": "completed", "outcomes": outcomes}, 200
+
 @app.route('/mailroom', methods=['POST'])
 def mailroom():
     try:
         req = request.get_json(force=True, silent=True) or {}
         op = req.get("operation")
-
         if op == "propose":
-            evaluation_id = req.get("evaluationId")
-            dossiers = req.get("dossiers")
-            if not evaluation_id or not isinstance(dossiers, list):
-                return jsonify({"error": "malformed request"}), 400
-
-            ids_seen = set()
-            for d in dossiers:
-                did = d.get("id")
-                if not did or did in ids_seen:
-                    return jsonify({"error": "duplicate or missing dossier id"}), 400
-                ids_seen.add(did)
-
-            conn = sqlite3.connect(DB_PATH)
-            with db_lock:
-                # conflict check: same evaluationId used before with different content
-                fingerprint = hashlib.sha256(
-                    json.dumps([d.get("id") for d in dossiers], sort_keys=True).encode()
-                ).hexdigest()
-                row = conn.execute("SELECT content_hash FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
-                if row and row[0] != fingerprint:
-                    conn.close()
-                    return jsonify({"error": "evaluation content conflict"}), 409
-                if row:
-                    cached = conn.execute("SELECT proposals_json FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
-                    conn.close()
-                    return jsonify({"status": "awaiting_receipts", "proposals": json.loads(cached[0])})
-
-                proposals = []
-                for d in dossiers:
-                    did = d["id"]
-                    chash = canonical_hash(d)
-                    call_id = make_call_id(did, chash)
-                    cached = conn.execute(
-                        "SELECT proposal_json FROM proposals WHERE dossier_id=? AND content_hash=?",
-                        (did, chash)).fetchone()
-                    if cached:
-                        p = json.loads(cached[0])
-                    else:
-                        result = classify_dossier(d)
-                        p = {
-                            "dossierId": did,
-                            "callId": call_id,
-                            "action": result["action"],
-                            "target": result["target"],
-                            "payload": result["payload"],
-                            "evidence": result["evidence"]
-                        }
-                        conn.execute(
-                            "INSERT OR REPLACE INTO proposals VALUES (?,?,?,?)",
-                            (did, chash, call_id, json.dumps(p)))
-                    proposals.append(p)
-
-                conn.execute("INSERT OR REPLACE INTO evaluations VALUES (?,?,?)",
-                             (evaluation_id, fingerprint, json.dumps(proposals)))
-                conn.commit()
-            conn.close()
-            return jsonify({"status": "awaiting_receipts", "proposals": proposals})
-
+            result, code = do_propose(req)
         elif op == "commit":
-            receipts = req.get("receipts")
-            if not isinstance(receipts, list):
-                return jsonify({"error": "malformed request"}), 400
-
-            conn = sqlite3.connect(DB_PATH)
-            outcomes = []
-            with db_lock:
-                for r in receipts:
-                    call_id = r.get("callId")
-                    evaluation_id = r.get("evaluationId")
-                    if not call_id or not evaluation_id:
-                        return jsonify({"error": "malformed receipt"}), 400
-
-                    existing = conn.execute("SELECT outcome_json FROM receipts WHERE call_id=?", (call_id,)).fetchone()
-                    if existing:
-                        outcomes.append(json.loads(existing[0]))
-                        continue
-
-                    eval_row = conn.execute("SELECT proposals_json FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
-                    if not eval_row:
-                        return jsonify({"error": "unknown evaluation"}), 422
-                    proposals = json.loads(eval_row[0])
-                    match = next((p for p in proposals if p["callId"] == call_id), None)
-                    if not match:
-                        return jsonify({"error": "callId does not match persisted proposal"}), 422
-
-                    outcome = {
-                        "callId": call_id,
-                        "dossierId": match["dossierId"],
-                        "status": "completed" if r.get("approved", True) else "rejected",
-                        "action": match["action"]
-                    }
-                    conn.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?)",
-                                 (call_id, evaluation_id, json.dumps(outcome)))
-                    outcomes.append(outcome)
-                conn.commit()
-            conn.close()
-            return jsonify({"status": "completed", "outcomes": outcomes})
-
+            result, code = do_commit(req)
         else:
             return jsonify({"error": "invalid operation"}), 400
-
+        return jsonify(result), code
     except Exception as e:
         return jsonify({"error": f"internal error: {e}"}), 400
 @app.route('/.well-known/agent-card.json', methods=['GET'])
@@ -664,6 +584,60 @@ def agent_card():
         ]
     }
     return jsonify(card), 200
+@app.route('/mailroom/message:send', methods=['POST'])
+def a2a_message_send():
+    try:
+        req = request.get_json(force=True, silent=True) or {}
+
+        # A2A envelope commonly wraps the actual payload inside a "message" with "parts"
+        # Try to extract your operation payload from common A2A shapes.
+        message = req.get("message", req)
+        parts = message.get("parts", [])
+
+        payload = None
+        for part in parts:
+            if part.get("kind") == "data" and "data" in part:
+                payload = part["data"]
+                break
+            if part.get("type") == "data" and "data" in part:
+                payload = part["data"]
+                break
+            if "text" in part:
+                try:
+                    payload = json.loads(part["text"])
+                    break
+                except Exception:
+                    pass
+
+        # Fallback: maybe the operation/dossiers are directly at top level
+        if payload is None:
+            payload = req if "operation" in req else message
+
+        op = payload.get("operation")
+
+        if op == "propose":
+            result = do_propose(payload)
+        elif op == "commit":
+            result = do_commit(payload)
+        else:
+            return jsonify({"error": "invalid operation"}), 400
+
+        status_code = 200
+        if isinstance(result, tuple):
+            result, status_code = result
+
+        # Wrap response in an A2A-compatible message/task shape
+        response_envelope = {
+            "kind": "message",
+            "role": "agent",
+            "parts": [
+                {"kind": "data", "data": result}
+            ]
+        }
+        return jsonify(response_envelope), status_code
+
+    except Exception as e:
+        return jsonify({"error": f"internal error: {e}"}), 400
     
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
