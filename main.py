@@ -606,6 +606,48 @@ def mailroom():
         return jsonify({"error": f"internal error: {e}"}), 400
 
 
+import sys
+
+@app.route('/mailroom', methods=['POST'])
+def mailroom():
+    try:
+        req = request.get_json(force=True, silent=True) or {}
+
+        # TEMP: log every request for debugging — check Render logs
+        print("INCOMING REQUEST:", json.dumps(req)[:2000], file=sys.stderr, flush=True)
+
+        if req.get("jsonrpc") == "2.0" and "method" in req:
+            return handle_a2a_jsonrpc(req)
+
+        op = req.get("operation")
+        if op == "propose":
+            result, code = do_propose(req)
+        elif op == "commit":
+            result, code = do_commit(req)
+        else:
+            return jsonify({"error": "invalid operation", "received_keys": list(req.keys())}), 400
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({"error": f"internal error: {e}"}), 400
+
+
+def find_operation_payload(obj):
+    """Recursively search for a dict containing an 'operation' key."""
+    if isinstance(obj, dict):
+        if "operation" in obj:
+            return obj
+        for v in obj.values():
+            found = find_operation_payload(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_operation_payload(item)
+            if found:
+                return found
+    return None
+
+
 def handle_a2a_jsonrpc(req):
     method = req.get("method")
     req_id = req.get("id")
@@ -617,23 +659,35 @@ def handle_a2a_jsonrpc(req):
             "error": {"code": -32601, "message": "Method not found"}
         }), 200
 
+    # Try structured parts first
     message = params.get("message", {})
-    parts = message.get("parts", [])
+    parts = message.get("parts", []) if isinstance(message, dict) else []
 
     payload = None
     for part in parts:
-        if part.get("kind") == "data" and "data" in part:
-            payload = part["data"]; break
-        if "text" in part:
-            try:
-                payload = json.loads(part["text"]); break
-            except Exception:
-                pass
+        if isinstance(part, dict):
+            if "data" in part:
+                payload = part["data"]
+                if isinstance(payload, dict) and "operation" in payload:
+                    break
+            if "text" in part:
+                try:
+                    parsed = json.loads(part["text"])
+                    if isinstance(parsed, dict) and "operation" in parsed:
+                        payload = parsed
+                        break
+                except Exception:
+                    pass
 
-    if not isinstance(payload, dict):
+    # Fallback: search the entire request recursively for an 'operation' key
+    if not (isinstance(payload, dict) and "operation" in payload):
+        payload = find_operation_payload(req)
+
+    if not isinstance(payload, dict) or "operation" not in payload:
         return jsonify({
             "jsonrpc": "2.0", "id": req_id,
-            "error": {"code": -32602, "message": "Invalid params: no usable data/text part"}
+            "error": {"code": -32602, "message": "Invalid params: could not locate operation payload",
+                      "debug_received": req}
         }), 200
 
     op = payload.get("operation")
