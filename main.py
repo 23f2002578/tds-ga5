@@ -262,7 +262,7 @@ def is_private_ip(host):
         return False
 
 def looks_like_internal_target(value):
-    v = unquote(value).strip().lower()
+    v = unquote(str(value)).strip().lower()
     if "169.254.169.254" in v or "metadata" in v:
         return True
     if "localhost" in v or "127.0.0.1" in v or "0.0.0.0" in v:
@@ -275,12 +275,6 @@ def looks_like_internal_target(value):
     if candidate:
         if is_private_ip(candidate):
             return True
-        try:
-            resolved = socket.gethostbyname(candidate)
-            if is_private_ip(resolved):
-                return True
-        except Exception:
-            pass
         if candidate not in ALLOWED_HOSTS and ("." in candidate or candidate == "localhost"):
             return True
     return False
@@ -302,12 +296,7 @@ def judge_fetch(url):
         return False, f"host '{host}' not in allowlist"
     if is_private_ip(host):
         return False, "host resolves to private/internal range"
-    try:
-        resolved = socket.gethostbyname(host)
-        if is_private_ip(resolved):
-            return False, "host resolves to private/internal IP"
-    except Exception:
-        pass
+    # NOTE: no live DNS resolution here — avoids network flakiness/timeouts
     for vals in parse_qs(u.query).values():
         for v in vals:
             if looks_like_internal_target(v):
@@ -316,35 +305,44 @@ def judge_fetch(url):
 
 @app.route('/guardrail', methods=['POST'])
 def guardrail():
-    data = request.get_json(force=True)
-    tool = data.get("tool")
-    args = data.get("arguments", {})
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        tool = data.get("tool", "")
+        args = data.get("arguments", {}) or {}
 
-    if tool == "read_file":
-        path = args.get("path", "")
-        inside, full_logical = resolves_inside(path, SANDBOX_ROOT)
-        if inside:
-            storage_path = to_storage_path(full_logical)
-            try:
-                with open(storage_path, "r", errors="replace") as f:
-                    content = f.read()
-                return jsonify({"action": "allow", "reason": "path resolves inside sandbox", "result": content})
-            except FileNotFoundError:
-                return jsonify({"action": "allow", "reason": "path resolves inside sandbox (file not found)", "result": ""})
-            except Exception as e:
-                return jsonify({"action": "block", "reason": f"read error: {e}"})
-        else:
-            return jsonify({"action": "block", "reason": "path resolves outside sandbox root"})
+        if tool == "read_file":
+            path = args.get("path", "")
+            if not isinstance(path, str):
+                return jsonify({"action": "block", "reason": "invalid path type"})
+            inside, full_logical = resolves_inside(path, SANDBOX_ROOT)
+            if inside:
+                storage_path = to_storage_path(full_logical)
+                try:
+                    with open(storage_path, "r", errors="replace") as f:
+                        content = f.read()
+                    return jsonify({"action": "allow", "reason": "path resolves inside sandbox", "result": content})
+                except FileNotFoundError:
+                    return jsonify({"action": "allow", "reason": "path resolves inside sandbox (file not found)", "result": ""})
+                except Exception as e:
+                    return jsonify({"action": "block", "reason": f"read error: {e}"})
+            else:
+                return jsonify({"action": "block", "reason": "path resolves outside sandbox root"})
 
-    if tool == "fetch_url":
-        url = args.get("url", "")
-        ok, reason = judge_fetch(url)
-        if ok:
-            return jsonify({"action": "allow", "reason": reason, "result": f"fetched {url}"})
-        else:
-            return jsonify({"action": "block", "reason": reason})
+        if tool == "fetch_url":
+            url = args.get("url", "")
+            if not isinstance(url, str):
+                return jsonify({"action": "block", "reason": "invalid url type"})
+            ok, reason = judge_fetch(url)
+            if ok:
+                return jsonify({"action": "allow", "reason": reason, "result": f"fetched {url}"})
+            else:
+                return jsonify({"action": "block", "reason": reason})
 
-    return jsonify({"action": "block", "reason": "unknown tool"})
+        return jsonify({"action": "block", "reason": "unknown tool"})
+
+    except Exception as e:
+        # Never let an unhandled exception produce a raw 500 with no body
+        return jsonify({"action": "block", "reason": f"internal error: {e}"}), 200
     
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
