@@ -641,6 +641,29 @@ def mailroom():
 
     except Exception as e:
         return jsonify({"error": f"internal error: {e}"}), 400
+@app.route('/.well-known/agent-card.json', methods=['GET'])
+def agent_card():
+    card = {
+        "name": "Safe AI Mailroom Agent",
+        "description": "Processes mail dossiers and proposes safe actions with receipt-based commit.",
+        "url": "https://skill-scanner-rktg.onrender.com/mailroom",
+        "version": "1.0.0",
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False
+        },
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": [
+            {
+                "id": "mailroom-propose-commit",
+                "name": "Mailroom propose/commit",
+                "description": "Accepts propose and commit operations for mail dossier processing.",
+                "tags": ["mailroom", "agent"]
+            }
+        ]
+    }
+    return jsonify(card), 200
     
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
