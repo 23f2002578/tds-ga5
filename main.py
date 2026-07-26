@@ -328,20 +328,20 @@ def guardrail():
     tool = data.get("tool")
     args = data.get("arguments", {})
 
-	if tool == "read_file":
-		path = args.get("path", "")
-		if resolves_inside(path, SANDBOX_ROOT):
-		    full = os.path.normpath(path) if os.path.isabs(path) else os.path.normpath(os.path.join(SANDBOX_ROOT, path))
-		    try:
-		        with open(full, "r", errors="replace") as f:
-		            content = f.read()
-		        return jsonify({"action": "allow", "reason": "path resolves inside sandbox", "result": content})
-		    except FileNotFoundError:
-		        return jsonify({"action": "allow", "reason": "path resolves inside sandbox (file not found)", "result": ""})
-		    except Exception as e:
-		        return jsonify({"action": "block", "reason": f"read error: {e}"})
-		else:
-		    return jsonify({"action": "block", "reason": "path resolves outside sandbox root"})
+    if tool == "read_file":
+            path = args.get("path", "")
+            if resolves_inside(path, SANDBOX_ROOT):
+                full = os.path.normpath(path) if os.path.isabs(path) else os.path.normpath(os.path.join(SANDBOX_ROOT, path))
+                try:
+                    with open(full, "r", errors="replace") as f:
+                        content = f.read()
+                     return jsonify({"action": "allow", "reason": "path resolves inside sandbox", "result": content})
+                except FileNotFoundError:
+                    return jsonify({"action": "allow", "reason": "path resolves inside sandbox (file not found)", "result": ""})
+                except Exception as e:
+                    return jsonify({"action": "block", "reason": f"read error: {e}"})
+            else:
+                return jsonify({"action": "block", "reason": "path resolves outside sandbox root"}))
     
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
