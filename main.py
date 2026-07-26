@@ -76,5 +76,7 @@ def scan():
     if has_unclear_provenance(text): cats.append('unclear_provenance')
     return jsonify({"categories": cats})
 
+import check
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
