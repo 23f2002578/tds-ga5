@@ -584,27 +584,6 @@ def do_commit(req):
 
     return {"status": "completed", "outcomes": outcomes}, 200
 
-@app.route('/mailroom', methods=['POST'])
-def mailroom():
-    try:
-        req = request.get_json(force=True, silent=True) or {}
-
-        # Support both: plain custom API calls, AND JSON-RPC A2A calls
-        if req.get("jsonrpc") == "2.0" and "method" in req:
-            return handle_a2a_jsonrpc(req)
-
-        # fallback: direct custom-format calls (operation at top level)
-        op = req.get("operation")
-        if op == "propose":
-            result, code = do_propose(req)
-        elif op == "commit":
-            result, code = do_commit(req)
-        else:
-            return jsonify({"error": "invalid operation"}), 400
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({"error": f"internal error: {e}"}), 400
-
 
 import sys
 
@@ -735,46 +714,6 @@ def agent_card():
     }
     return jsonify(card), 200
 
-@app.route('/mailroom/message:send', methods=['POST'])
-def a2a_message_send():
-    try:
-        req = request.get_json(force=True, silent=True) or {}
-        message = req.get("message", req)
-        parts = message.get("parts", []) if isinstance(message, dict) else []
-
-        payload = None
-        for part in parts:
-            if part.get("kind") == "data" and "data" in part:
-                payload = part["data"]; break
-            if part.get("type") == "data" and "data" in part:
-                payload = part["data"]; break
-            if "text" in part:
-                try:
-                    payload = json.loads(part["text"]); break
-                except Exception:
-                    pass
-        if payload is None:
-            payload = req if "operation" in req else message
-        if not isinstance(payload, dict):
-            return jsonify({"error": "malformed A2A payload"}), 400
-
-        op = payload.get("operation")
-        if op == "propose":
-            result, status_code = do_propose(payload)
-        elif op == "commit":
-            result, status_code = do_commit(payload)
-        else:
-            return jsonify({"error": "invalid operation"}), 400
-
-        response_envelope = {
-            "kind": "message",
-            "role": "agent",
-            "parts": [{"kind": "data", "data": result}]
-        }
-        return jsonify(response_envelope), status_code
-
-    except Exception as e:
-        return jsonify({"error": f"internal error: {e}"}), 400
 
 
 if __name__ == '__main__':
